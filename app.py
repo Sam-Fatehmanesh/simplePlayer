@@ -24,7 +24,7 @@ app.jinja_env.variable_end_string = ']}'
 
 # Configuration
 app.config['SECRET_KEY'] = 'your-secret-key-here'
-app.config['PASSWORD'] = 'fuckyourmother'  # Password for users to access the app
+app.config['PASSWORD'] = 'lalala'  # Password for users to access the app
 # No longer need TEMP_DIR
 
 # Authentication
