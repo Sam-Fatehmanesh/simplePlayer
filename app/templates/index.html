@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MusicFun - Web Music Player</title>
+    <title>RickettsRadio - Web Music Player</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
     <link rel="stylesheet" href="/static/css/styles.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -12,95 +12,105 @@
 </head>
 <body>
     <div id="app">
-        <header>
+        <nav class="sidebar">
             <div class="logo">
-                <i class="fas fa-music"></i>
-                <h1>MusicFun</h1>
+                <i class="fas fa-headphones-alt"></i>
+                <h1>RickettsRadio</h1>
             </div>
-            <div class="search-box">
-                <input type="text" id="search-input" placeholder="Search for music..." v-model="searchQuery" @keyup.enter="searchMusic">
-                <button id="search-button" @click="searchMusic">
-                    <i class="fas fa-search"></i>
-                </button>
-            </div>
-        </header>
+            <ul>
+                <li><a href="#"><i class="fas fa-home"></i> Home</a></li> 
+                <li><a href="#"><i class="fas fa-search"></i> Search</a></li>
+                <li><a href="#"><i class="fas fa-stream"></i> Queue</a></li>
+            </ul>
+        </nav>
 
-        <main>
-            <div class="container">
-                <div class="music-section">
-                    <div class="search-results" v-if="searchResults.length > 0">
-                        <h2>Search Results</h2>
-                        <div class="results-container">
-                            <div class="music-card" v-for="(result, index) in searchResults" :key="index">
-                                <div class="thumbnail">
-                                    <img :src="result.thumbnail || '/static/images/default-thumbnail.jpg'" :alt="result.title">
-                                </div>
-                                <div class="details">
-                                    <h3>{{ result.title }}</h3>
-                                </div>
-                                <div class="actions">
-                                    <button class="add-button" @click="addToQueue(result)">
-                                        <i class="fas fa-plus"></i> Add to Queue
-                                    </button>
-                                </div>
+        <div class="main-content">
+            <header class="main-header">
+                <div class="search-box">
+                    <i class="fas fa-search search-icon"></i>
+                    <input type="text" id="search-input" placeholder="What do you want to listen to?" v-model="searchQuery" @keyup.enter="searchMusic">
+                </div>
+            </header>
+
+            <main class="content-area">
+                <div class="search-results-section" v-if="searchResults.length > 0">
+                    <h2>Search Results</h2>
+                    <div class="results-list">
+                        <div class="list-item" v-for="(result, index) in searchResults" :key="index">
+                            <div class="list-item-details">
+                                <h3>{{ result.title }}</h3>
                             </div>
-                        </div>
-                    </div>
-
-                    <div class="queue-section">
-                        <div class="queue-header">
-                            <h2>Current Queue</h2>
-                            <button class="clear-queue" @click="clearQueue" v-if="queue.length > 0">
-                                <i class="fas fa-trash"></i> Clear Queue
-                            </button>
-                        </div>
-                        
-                        <div class="empty-queue" v-if="queue.length === 0">
-                            <i class="fas fa-music"></i>
-                            <p>Queue is empty. Search for music to add to your queue.</p>
-                        </div>
-                        
-                        <div class="queue-container" v-else>
-                            <div class="queue-item" v-for="(track, index) in queue" :key="index" :class="{ 'now-playing': index === 0 && isPlaying }">
-                                <div class="queue-number">{{ index + 1 }}</div>
-                                <div class="queue-thumbnail">
-                                    <img :src="track.thumbnail || '/static/images/default-thumbnail.jpg'" :alt="track.title">
-                                    <div class="now-playing-indicator" v-if="index === 0 && isPlaying">
-                                        <i class="fas fa-volume-up"></i>
-                                    </div>
-                                </div>
-                                <div class="queue-details">
-                                    <h3>{{ track.title }}</h3>
-                                </div>
-                                <div class="queue-actions">
-                                    <button class="remove-button" @click="removeFromQueue(index)">
-                                        <i class="fas fa-times"></i>
-                                    </button>
-                                </div>
+                            <div class="list-item-actions">
+                                <button class="icon-button add-button" @click="addToQueue(result)" title="Add to Queue">
+                                    <i class="fas fa-plus"></i>
+                                </button>
                             </div>
                         </div>
                     </div>
                 </div>
-            </div>
-        </main>
 
-        <footer class="player-controls" v-if="currentTrack">
+                <div class="queue-section">
+                    <div class="queue-header">
+                        <h2>Queue</h2>
+                        <button class="text-button clear-queue" @click="clearQueue" v-if="queue.length > 0">
+                            Clear Queue
+                        </button>
+                    </div>
+                    
+                    <div class="empty-queue" v-if="queue.length === 0">
+                        <i class="fas fa-list-ul"></i>
+                        <p>Your queue is empty.</p>
+                        <p>Search for music to add.</p>
+                    </div>
+                    
+                    <div class="queue-list" v-else>
+                        <div class="list-item queue-list-item" v-for="(track, index) in queue" :key="track.id || index" :class="{ 'now-playing': index === 0 && isPlaying }">
+                            <div class="queue-number">{{ index + 1 }}</div>
+                            <div class="queue-thumbnail-placeholder" v-if="index === 0 && isPlaying">
+                                <i class="fas fa-volume-up"></i>
+                            </div>
+                            <div class="queue-thumbnail-placeholder" v-else>
+                                <i class="fas fa-music"></i>
+                            </div>
+                            <div class="list-item-details">
+                                <h3>{{ track.title }}</h3>
+                            </div>
+                            <div class="list-item-actions">
+                                <button class="icon-button remove-button" @click="removeFromQueue(index)" title="Remove from Queue">
+                                    <i class="fas fa-times"></i>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+
+        <footer class="player-controls">
             <div class="now-playing-info">
-                <div class="now-playing-thumbnail">
-                    <img :src="currentTrack.thumbnail || '/static/images/default-thumbnail.jpg'" :alt="currentTrack.title">
-                </div>
-                <div class="now-playing-details">
-                    <h3>{{ currentTrack.title }}</h3>
+                <div v-if="!currentTrack" class="track-placeholder">Select a song to play</div>
+                <div v-if="currentTrack" class="track-details">
+                    <div class="track-text">
+                        <span class="track-title">{{ currentTrack.title }}</span>
+                    </div>
                 </div>
             </div>
             
-            <div class="controls">
-                <button class="control-button" @click="stopPlayback">
+            <div class="player-center-controls">
+                <button class="icon-button control-button" @click="stopPlayback" title="Stop">
                     <i class="fas fa-stop"></i>
                 </button>
-                <button class="control-button play-pause" @click="togglePlayPause">
+                <button class="icon-button control-button play-pause" @click="togglePlayPause" :title="isPlaying ? 'Pause' : 'Play'">
                     <i :class="isPlaying ? 'fas fa-pause' : 'fas fa-play'"></i>
                 </button>
+            </div>
+            
+            <div class="player-right-controls">
+                <div class="volume-control">
+                    <i class="fas fa-volume-down"></i>
+                    <input type="range" min="0" max="100" v-model="currentVolume" @input="setVolume" title="Volume">
+                    <i class="fas fa-volume-up"></i>
+                </div>
             </div>
         </footer>
     </div>

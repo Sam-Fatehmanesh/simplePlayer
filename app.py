@@ -2,14 +2,13 @@ import os
 import json
 import threading
 import time
-import tempfile
 import logging
 from functools import wraps
-from flask import Flask, request, jsonify, render_template, send_from_directory
+from flask import Flask, request, jsonify, render_template, send_from_directory, Response, stream_with_context
 from flask_httpauth import HTTPBasicAuth
 import yt_dlp
 import vlc
-from queue import Queue
+import requests # For proxying
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,50 +25,36 @@ app.jinja_env.variable_end_string = ']}'
 # Configuration
 app.config['SECRET_KEY'] = 'your-secret-key-here'
 app.config['PASSWORD'] = 'musicfun'  # Password for users to access the app
-app.config['TEMP_DIR'] = os.path.join(tempfile.gettempdir(), 'musicfun_audio')
-
-# Create temp directory if it doesn't exist
-if not os.path.exists(app.config['TEMP_DIR']):
-    logger.info(f"Creating temporary directory: {app.config['TEMP_DIR']}")
-    os.makedirs(app.config['TEMP_DIR'])
-else:
-    logger.info(f"Using existing temporary directory: {app.config['TEMP_DIR']}")
+# No longer need TEMP_DIR
 
 # Authentication
 auth = HTTPBasicAuth()
 
 @auth.verify_password
 def verify_password(username, password):
-    # For simplicity, we use a single password for all users
-    # You could extend this to use a user database
     if password == app.config['PASSWORD']:
         return username
     return None
 
-def cleanup_temp_file(file_path):
-    """Safely remove a temporary file."""
-    try:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-            logger.info(f"Cleaned up temporary file: {file_path}")
-    except OSError as e:
-        logger.error(f"Error removing temporary file {file_path}: {e}")
-
-# Global queue for background download tasks
-download_queue = Queue()
+# Removed cleanup_temp_file and cleanup_queue/worker
 
 # Music Player
 class MusicPlayer:
     def __init__(self):
         self.queue = []
-        self.current_track = None
+        self.current_track = None # Will store full track info including stream_url when playing
         self.player = None
         self.instance = vlc.Instance()
         self.player = self.instance.media_player_new()
+        # Set initial volume (optional, e.g., 80%)
+        self.player.audio_set_volume(80)
         self.is_playing = False
         self.lock = threading.Lock()
+        # No longer need pending_downloads set
+        self.last_playback_time = 0 # Store time before error/stop
+        self.current_track_retry_count = 0
+        self.max_retries = 2 # Max attempts to restart a stream
         self.start_player_thread()
-        self.pending_downloads = set() # Keep track of IDs being downloaded
 
     def start_player_thread(self):
         """Start a thread that continuously plays songs from the queue"""
@@ -77,352 +62,420 @@ class MusicPlayer:
         self.player_thread.start()
 
     def _player_worker(self):
-        """Background worker that processes the music queue"""
+        """Background worker handling queue, playback, and optimized stream restarts."""
         while True:
-            track_to_play = None
-            current_file_path = None
-            track_id = None
-            with self.lock:
-                if not self.is_playing and self.queue:
-                    track_to_play = self.queue[0]
-                    track_id = track_to_play.get('id')
-                    current_file_path = track_to_play.get('file_path')
+            track_to_play_next = None
+            track_id_to_play_next = None
+            attempt_restart = False
+            track_info_for_restart = None
+            restart_seek_time = 0
 
-            if track_to_play:
-                if current_file_path:
-                     # We have a file path, attempt to play
-                     logger.info(f"Worker: Attempting to play {track_to_play['title']} from {current_file_path}")
-                     if os.path.exists(current_file_path):
-                         with self.lock: 
-                             if self.queue and self.queue[0]['id'] == track_id: # Check if track is still first
-                                 self.current_track = track_to_play 
-                                 self.play(current_file_path)
-                             else:
-                                  logger.info(f"Worker: Track {track_id} was no longer first in queue when trying to play.")
-                     else:
-                         logger.error(f"Worker: File path {current_file_path} for {track_id} exists in queue data but not on disk! Skipping.")
-                         # Potentially remove the bad entry here?
-                         with self.lock:
-                              if self.queue and self.queue[0]['id'] == track_id:
-                                   self.queue.pop(0)
-                              self.current_track = None # Ensure it's cleared
-                              self.is_playing = False # Ensure it's cleared
-                elif track_id in self.pending_downloads:
-                     # File path missing, but download is in progress
-                     logger.info(f"Worker: Waiting for download of {track_id} ({track_to_play['title']})...")
-                     # No action, just wait for the download thread to update the path
+            # --- State Check and Action Decision (within Lock) ---
+            with self.lock:
+                # A. Check for Error/Stopped state requiring potential restart
+                if self.is_playing and self.player and self.current_track:
+                    state = self.player.get_state()
+                    if state == vlc.State.Error or \
+                       (state == vlc.State.Stopped and not hasattr(self.player, '_manually_stopped')):
+                        
+                        logger.warning(f"Worker: Detected unexpected stop/error (State: {state}) for {self.current_track['title']}")
+                        if self.current_track_retry_count < self.max_retries:
+                            # Prepare for restart
+                            attempt_restart = True
+                            track_info_for_restart = self.current_track.copy()
+                            restart_seek_time = self.player.get_time()
+                            self.current_track_retry_count += 1
+                            logger.info(f"Preparing restart #{self.current_track_retry_count} for {track_info_for_restart['id']} from {restart_seek_time}ms")
+                            self.player.stop() # Stop player cleanly
+                            self.is_playing = False
+                            # Keep self.current_track set for restart attempt
+                        else:
+                            # Max retries reached - Give up
+                            logger.error(f"Worker: Max retries ({self.max_retries}) reached for {self.current_track['title']}. Giving up.")
+                            if self.queue and self.queue[0]['id'] == self.current_track['id']:
+                                self.queue.pop(0)
+                            self.is_playing = False
+                            self.current_track = None
+                            self.current_track_retry_count = 0
+                            self.last_playback_time = 0
+                            
+                    # Clear manual stop flag if detected
+                    elif state == vlc.State.Stopped and hasattr(self.player, '_manually_stopped'):
+                        logger.info("Worker: Clearing manual stop flag.")
+                        del self.player._manually_stopped
+                        # State (is_playing=False, current_track=None) should already be correct from stop()
+                
+                # B. Check if we should play the next track (only if idle and not restarting)
+                if not self.is_playing and not attempt_restart and self.queue:
+                    track_to_play_next = self.queue[0]
+                    track_id_to_play_next = track_to_play_next.get('id')
+                    self.current_track_retry_count = 0 # Reset retries for new track
+                    self.last_playback_time = 0
+
+            # --- Perform Actions (outside Lock for network calls) --- 
+            
+            # 1. Handle Restart Attempt
+            if attempt_restart and track_info_for_restart:
+                track_id = track_info_for_restart['id']
+                original_video_url = track_info_for_restart.get('url')
+                logger.info(f"Restart: Fetching new stream info for {track_id}")
+                new_stream_url = None
+                try:
+                    # Synchronously fetch new stream info
+                    new_track_info = get_audio_stream_info(original_video_url)
+                    new_stream_url = new_track_info.get('stream_url')
+                except Exception as e:
+                    logger.error(f"Restart: Failed to get new stream info for {track_id}: {e}")
+                    # Give up on fetch failure
+                    with self.lock:
+                         if self.current_track and self.current_track['id'] == track_id:
+                             if self.queue and self.queue[0]['id'] == track_id:
+                                 self.queue.pop(0)
+                             self.is_playing = False # Ensure state is cleared
+                             self.current_track = None
+                             self.current_track_retry_count = 0 
+                             self.last_playback_time = 0
+                    continue # Next worker loop iteration
+
+                # If fetch succeeded, try to play
+                if new_stream_url:
+                    with self.lock:
+                         # Check track is still current
+                         if self.current_track and self.current_track['id'] == track_id:
+                             logger.info(f"Restart: Got new stream URL. Updating and playing.")
+                             self.current_track['stream_url'] = new_stream_url # Update URL
+                             local_proxy_url = f"http://127.0.0.1:{app.config.get('SERVER_PORT', 5000)}/stream/{track_id}"
+                             self.play(local_proxy_url, seek_time=restart_seek_time)
+                         else:
+                              logger.warning(f"Restart: Track {track_id} was no longer current. Aborting restart play.")
                 else:
-                     # File path missing and not in pending downloads - something went wrong
-                     logger.error(f"Worker: Track {track_id} ({track_to_play['title']}) is in queue without file_path and not pending download. Removing.")
-                     with self.lock:
-                          if self.queue and self.queue[0]['id'] == track_id:
-                               self.queue.pop(0)
-                          self.current_track = None
-                          self.is_playing = False
-                          
-            # Check if the current song has finished
-            if self.player and self.is_playing:
+                    # Fetch reported success but no URL? Give up.
+                    logger.error(f"Restart: Failed to obtain a new stream URL for {track_id}. Giving up.")
+                    with self.lock:
+                         if self.current_track and self.current_track['id'] == track_id:
+                             if self.queue and self.queue[0]['id'] == track_id:
+                                 self.queue.pop(0)
+                             self.is_playing = False # Ensure state is cleared
+                             self.current_track = None
+                             self.current_track_retry_count = 0 
+                             self.last_playback_time = 0
+            
+            # 2. Handle Starting Next Track
+            elif track_to_play_next:
+                logger.info(f"Worker: Starting normal playback for {track_to_play_next['title']}")
+                local_stream_proxy_url = f"http://127.0.0.1:{app.config.get('SERVER_PORT', 5000)}/stream/{track_id_to_play_next}"
+                with self.lock: 
+                    # Check if track is still first
+                    if self.queue and self.queue[0]['id'] == track_id_to_play_next:
+                        self.current_track = track_to_play_next 
+                        self.play(local_stream_proxy_url) # Play normally (no seek)
+                    else:
+                        logger.info(f"Worker: Track {track_id_to_play_next} was no longer first when trying normal play.")
+            
+            # 3. Check for Natural Track End (only if not restarting/starting)
+            elif self.is_playing and self.player: # Use elif to avoid check immediately after starting
                 state = self.player.get_state()
                 if state == vlc.State.Ended:
-                    logger.info(f"Worker: Track finished: {self.current_track['title']}")
-                    finished_track_path = None
-                    with self.lock:
-                        if self.queue and self.current_track and self.queue[0]['id'] == self.current_track['id']:
-                            finished_track = self.queue.pop(0)  
-                            finished_track_path = finished_track.get('file_path')
-                        else:
-                             logger.warning("Worker: Track ended but queue state was unexpected.")
-                        self.is_playing = False
-                        self.current_track = None
-                    if finished_track_path:
-                        cleanup_temp_file(finished_track_path)
-            
-            time.sleep(0.5)
+                     with self.lock:
+                         if self.is_playing and self.current_track: # Still playing this track?
+                             logger.info(f"Worker: Detected normal playback end for {self.current_track['title']}. Advancing queue.")
+                             if self.queue and self.queue[0]['id'] == self.current_track['id']:
+                                 self.queue.pop(0) 
+                             self.is_playing = False
+                             self.current_track = None
+                             self.current_track_retry_count = 0 
+                             self.last_playback_time = 0
+                         
+            # --- Delay before next cycle ---
+            time.sleep(0.25)
 
     def add_to_queue(self, track):
-        """Add track info (potentially partial) to the queue."""
+        """Add track info (including stream_url) to the queue."""
         with self.lock:
             self.queue.append(track)
-            if not track.get('file_path'): # Mark as pending if path is missing
-                 self.pending_downloads.add(track['id'])
-            logger.info(f"Added to queue: {track['title']} (ID: {track['id']}, Path known: {track.get('file_path') is not None})")
+            logger.info(f"Added to queue: {track['title']} (ID: {track['id']})")
         return len(self.queue)
-
-    def update_track_filepath(self, track_id, file_path):
-        """Update an existing track in the queue with its file path once downloaded."""
-        with self.lock:
-            found = False
-            for i, track in enumerate(self.queue):
-                if track['id'] == track_id:
-                    self.queue[i]['file_path'] = file_path
-                    logger.info(f"Updated file path for track {track_id} ({track['title']})")
-                    found = True
-                    break
-            if found:
-                self.pending_downloads.discard(track_id)
-            else:
-                logger.warning(f"Tried to update file path for track {track_id}, but it was not found in the queue (perhaps removed).")
-                # If not found, the file is orphaned, clean it up
-                cleanup_temp_file(file_path)
+        
+    # Removed update_track_filepath
 
     def remove_from_queue(self, index):
+        """Remove a track from the queue."""
         removed_track = None
-        removed_file_path = None
         removed_track_id = None
         with self.lock:
-            if 0 <= index < len(self.queue):
-                track_to_remove = self.queue[index]
-                removed_track_id = track_to_remove.get('id')
-                # ... (rest of the existing logic for stopping/popping) ...
-                if index == 0 and self.is_playing:
-                    logger.info("Removing currently playing track")
-                    self.stop() 
-                    removed_track = self.queue.pop(0)
-                    self.is_playing = False 
-                    self.current_track = None 
-                elif index == 0 and not self.is_playing and self.current_track:
-                     logger.info("Removing the next track before it played")
-                     removed_track = self.queue.pop(0)
-                     removed_file_path = removed_track.get('file_path')
-                     self.current_track = None
-                else:
-                    logger.info(f"Removing track at index {index}")
-                    removed_track = self.queue.pop(index)
-                    removed_file_path = removed_track.get('file_path')
+            if not (0 <= index < len(self.queue)):
+                logger.warning(f"Remove request for invalid index: {index}")
+                return None
                 
-                # Remove from pending downloads if it was there
-                if removed_track_id:
-                    self.pending_downloads.discard(removed_track_id)
+            track_to_remove = self.queue[index]
+            removed_track_id = track_to_remove.get('id')
             
-        if removed_file_path:
-             cleanup_temp_file(removed_file_path)
-             
+            # Handle removing the currently playing track
+            if index == 0 and self.is_playing and self.current_track and self.current_track['id'] == removed_track_id:
+                logger.info(f"Removing currently playing track: {track_to_remove['title']}")
+                # Stop VLC player
+                if self.player:
+                    self.player.stop()
+                # Update state immediately
+                self.is_playing = False 
+                self.current_track = None 
+                # Reset retry count if removing the track that was playing/current
+                self.current_track_retry_count = 0
+                self.last_playback_time = 0
+                # Also update state if playing (as done before)
+                if self.is_playing:
+                     if self.player:
+                         self.player._manually_stopped = True 
+                     self.is_playing = False
+                else:
+                     # If not playing but was current track, ensure current_track is cleared
+                      self.current_track = None
+                # Remove from queue list
+                removed_track = self.queue.pop(0)
+            else:
+                # Handle removing other tracks (or index 0 if not playing)
+                logger.info(f"Removing track at index {index}: {track_to_remove['title']}")
+                # Reset retry count if removing the track that was playing/current
+                if index == 0 and self.current_track and self.current_track['id'] == removed_track_id:
+                    self.current_track_retry_count = 0
+                    self.last_playback_time = 0
+                    # Also update state if playing (as done before)
+                    if self.is_playing:
+                         if self.player:
+                             self.player._manually_stopped = True 
+                         self.is_playing = False
+                    else:
+                         # If not playing but was current track, ensure current_track is cleared
+                          self.current_track = None
+                # Pop the item (as done before)
+                if 0 <= index < len(self.queue): # Re-check bounds after potential modification
+                     if self.queue[index]['id'] == removed_track_id: # Verify ID again
+                         removed_track = self.queue.pop(index)
+                     else: # Index might be wrong now if index 0 was handled
+                          # Search for the track by ID if index seems wrong
+                          original_index = -1
+                          for i, t in enumerate(self.queue):
+                               if t['id'] == removed_track_id:
+                                    original_index = i
+                                    break
+                          if original_index != -1:
+                               removed_track = self.queue.pop(original_index)
+                          else:
+                               logger.warning(f"Could not find track ID {removed_track_id} to remove after index {index} was handled.")
+            
+            # No file path cleanup needed here anymore
+            
         return removed_track
         
     def clear_queue(self):
-        files_to_cleanup = []
-        ids_to_clear = set()
+        """Clear the queue."""
         with self.lock:
             logger.info("Clearing queue")
             if self.is_playing:
-                self.stop() 
-            
-            files_to_cleanup = [track.get('file_path') for track in self.queue if track.get('file_path')]
-            ids_to_clear = {track.get('id') for track in self.queue if track.get('id')}
+                if self.player:
+                    self.player.stop()
             
             self.queue.clear()
             self.is_playing = False
             self.current_track = None
-            # Clear pending downloads as well
-            self.pending_downloads.intersection_update(ids_to_clear) # Keep only relevant pending downloads
-            # It might be safer to just clear all pending on queue clear:
-            self.pending_downloads.clear()
-        
-        for f_path in files_to_cleanup:
-            cleanup_temp_file(f_path)
+            self.current_track_retry_count = 0 # Reset retries
+            self.last_playback_time = 0
+            # No pending downloads or files to clear
+        logger.info("Queue cleared")
 
-    def play(self, file_path):
-        """Play a specific file, adding network caching"""
-        if not os.path.exists(file_path):
-            logger.error(f"Play: File does not exist: {file_path}")
-            # Potentially handle this by stopping or skipping
-            self.is_playing = False 
-            self.current_track = None 
-            # Maybe remove the track from queue here if it's persistently not found?
-            return False
-        
-        logger.info(f"Play: Starting playback for {file_path}")
-        # Add network caching option (though less critical for local files)
-        media = self.instance.media_new(file_path, ':network-caching=1000') 
+    def play(self, stream_proxy_url, seek_time=0):
+        """Play from the local stream proxy URL, optionally seeking."""
+        logger.info(f"Play: Telling VLC to play from proxy URL: {stream_proxy_url}")
+        media = self.instance.media_new(stream_proxy_url, ':network-caching=3000') 
         self.player.set_media(media)
-        self.player.play()
-        self.is_playing = True
-        return True
+        success = self.player.play()
+        if success == -1:
+             logger.error(f"VLC failed to play media from {stream_proxy_url}")
+             with self.lock:
+                  self.is_playing = False
+             return False
+        else:
+             self.is_playing = True
+             logger.info(f"VLC initiated playback for {stream_proxy_url}")
+             if seek_time > 1000: # Only seek if time is significant (e.g., > 1 second)
+                 # Attempt to seek *after* playback starts
+                 # There might be a slight delay needed for the player to be ready
+                 # Using a small delay here. A more robust way involves VLC events, but is complex.
+                 def _delayed_seek(time_ms):
+                      try:
+                           # Wait briefly for player state to hopefully become Playing
+                           time.sleep(0.5) 
+                           logger.info(f"Attempting to seek to {time_ms}ms")
+                           # set_time returns 0 on success, -1 on error.
+                           seek_success = self.player.set_time(time_ms)
+                           if seek_success == 0:
+                                logger.info(f"Successfully seeked to {time_ms}ms")
+                           else:
+                                logger.warning(f"Failed to seek to {time_ms}ms (return code: {seek_success}). Player state: {self.player.get_state()}")
+                                # Try set_position as a fallback?
+                                # pos = time_ms / (self.player.get_length() or 1) 
+                                # self.player.set_position(pos)
+                      except Exception as e:
+                           logger.error(f"Error during delayed seek: {e}")
 
-    def pause(self):
-        """Pause current playback"""
-        if self.player and self.is_playing:
-            logger.info("Pausing playback")
-            self.player.pause()
-            self.is_playing = False
-            return True
-        return False
+                 # Run the seek in a separate thread to avoid blocking the play call
+                 seek_thread = threading.Thread(target=_delayed_seek, args=(seek_time,), daemon=True)
+                 seek_thread.start()
+                 
+             return True
 
-    def resume(self):
-        """Resume paused playback"""
-        if self.player and not self.is_playing and self.current_track:
-            logger.info("Resuming playback")
-            self.player.play()
-            self.is_playing = True
-            return True
-        return False
+    # ... (Keep pause, resume)
 
     def stop(self):
-        """Stop current playback and handle cleanup"""
-        file_to_cleanup = None
+        """Stop current playback."""
         with self.lock:
-            if not self.player or not self.current_track:
-                 return False # Nothing to stop
+            if not self.player or not self.is_playing:
+                 logger.info("Stop called but nothing seems to be playing.")
+                 return False 
                  
-            logger.info(f"Stopping playback for: {self.current_track['title']}")
+            current_title = self.current_track['title'] if self.current_track else "N/A"
+            logger.info(f"Stopping playback via stop() for: {current_title}")
+            # Mark that stop was called manually *before* calling stop
+            self.player._manually_stopped = True 
             self.player.stop()
             self.is_playing = False
-            # We don't remove from queue here, the worker loop handles that on State.Ended or next play
-            # But we need the path for potential cleanup if stop is called mid-play
-            file_to_cleanup = self.current_track.get('file_path')
-            self.current_track = None # Clear current track info
-
-        # File cleanup is now primarily handled by the worker when a track finishes
-        # or by remove/clear queue methods. Stopping mid-play is less common.
-        # If needed, cleanup could be triggered here, but might conflict with worker.
-        # For now, let the worker handle cleanup on natural end.
+            self.current_track = None 
+            self.current_track_retry_count = 0 # Reset retries on manual stop
+            self.last_playback_time = 0
         return True
 
     def get_queue(self):
-        """Get the current queue of tracks (excluding file paths)"""
+        """Get the current queue of tracks (excluding stream URLs)."""
         with self.lock:
-            # Return a version of the queue suitable for the frontend (no local paths)
-            return [{k: v for k, v in track.items() if k != 'file_path'} for track in self.queue]
+            # Return a version of the queue suitable for the frontend
+            return [{k: v for k, v in track.items() if k != 'stream_url'} for track in self.queue]
 
     def get_status(self):
-        """Get the current player status (excluding file paths)"""
+        """Get the current player status (excluding stream URLs)."""
         with self.lock:
             current_track_info = None
             if self.current_track:
-                 # Return a version suitable for the frontend
-                 current_track_info = {k: v for k, v in self.current_track.items() if k != 'file_path'}
+                 current_track_info = {k: v for k, v in self.current_track.items() if k != 'stream_url'}
+            
+            current_volume = self.get_volume() # Get current volume
             
             return {
                 'is_playing': self.is_playing,
                 'current_track': current_track_info,
                 'queue_length': len(self.queue),
+                'volume': current_volume, # Add volume to status
             }
+
+    def get_volume(self):
+        """Get the current volume (0-100)."""
+        if self.player:
+            return self.player.audio_get_volume()
+        return 0 # Default or error value
+
+    def set_volume(self, volume):
+        """Set the volume (0-100)."""
+        if self.player:
+            # Clamp volume between 0 and 100 (VLC might allow >100, but UI standard is 0-100)
+            clamped_volume = max(0, min(100, int(volume)))
+            logger.info(f"Setting volume to: {clamped_volume}")
+            return self.player.audio_set_volume(clamped_volume)
+        return -1 # Indicate error
 
 # Initialize player
 player = MusicPlayer()
 
-# YouTube Audio Downloader
-def download_audio_to_temp(video_url):
-    """Download audio from YouTube to a temporary file and return track info including the path."""
-    
-    # Define the output template using video ID (extension will be added by postprocessor)
-    temp_filename_tmpl = os.path.join(app.config['TEMP_DIR'], '%(id)s')
-    
+# YouTube Stream Info Extractor
+def get_audio_stream_info(video_url):
+    """Get metadata and best audio stream URL from YouTube."""
     ydl_opts = {
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3', # Using mp3 for broad compatibility
-            'preferredquality': '192',
-        }],
-        'outtmpl': temp_filename_tmpl + '.%(ext)s', # Use base template for ytdl
-        'noplaylist': True,
-        'quiet': False, 
-        'no_warnings': False,
-        'noprogress': True, 
-        'keepvideo': False, 
-        'overwrites': True, 
-    }
-    
-    logger.info(f"Attempting to download and process {video_url}")
-    logger.info(f"Output template base: {temp_filename_tmpl}")
-    
-    download_ret_code = -1
-    info = None
-    final_file_path = None
-    video_id = None
-    
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            logger.info(f"Extracting info for {video_url}...")
-            info = ydl.extract_info(video_url, download=False)
-            video_id = info.get('id')
-            if not video_id:
-                raise Exception("Could not extract video ID.")
-            
-            # Construct the expected final path (postprocessor adds .mp3)
-            final_file_path = os.path.join(app.config['TEMP_DIR'], f"{video_id}.mp3")
-            logger.info(f"Expected final file path after postprocessing: {final_file_path}")
-
-            # Perform the download and conversion
-            logger.info(f"Starting download and processing for {video_id}...")
-            # ydl instance already has the correct opts
-            download_ret_code = ydl.download([video_url]) 
-            logger.info(f"Download/processing call completed for {video_id} with code {download_ret_code}")
-
-    except yt_dlp.utils.DownloadError as e:
-        logger.error(f"yt-dlp download error for {video_url}: {e}")
-        if final_file_path and os.path.exists(final_file_path):
-            cleanup_temp_file(final_file_path)
-        # Also check for intermediate files based on template
-        intermediate_path = os.path.join(app.config['TEMP_DIR'], f"{video_id}.{info.get('ext')}" if info else f"{video_id}.tmp")
-        if os.path.exists(intermediate_path):
-             cleanup_temp_file(intermediate_path)
-        raise Exception(f"Failed to download audio: {e}") from e
-    except Exception as e:
-        logger.error(f"Unexpected error during download processing for {video_url}: {e}")
-        if final_file_path and os.path.exists(final_file_path):
-            cleanup_temp_file(final_file_path)
-        intermediate_path = os.path.join(app.config['TEMP_DIR'], f"{video_id}.{info.get('ext')}" if info and video_id else f"unknown.tmp")
-        if os.path.exists(intermediate_path):
-             cleanup_temp_file(intermediate_path)
-        raise 
-
-    if download_ret_code != 0:
-        logger.error(f"yt-dlp download returned non-zero code: {download_ret_code} for {video_url}")
-        if final_file_path and os.path.exists(final_file_path):
-             cleanup_temp_file(final_file_path)
-        raise Exception(f"Download failed with code {download_ret_code}")
-
-    # Verify the final MP3 file exists
-    if not final_file_path or not os.path.exists(final_file_path):
-         logger.error(f"Download process completed for {video_url}, but the expected file is missing: {final_file_path}")
-         # Check if original extension file exists (post-processing might have failed)
-         original_ext = info.get('ext', 'unknown')
-         potential_original_path = os.path.join(app.config['TEMP_DIR'], f"{video_id}.{original_ext}")
-         if os.path.exists(potential_original_path):
-             logger.warning(f"Expected MP3 not found, but original file exists: {potential_original_path}. Cleaning it up.")
-             cleanup_temp_file(potential_original_path)
-             raise Exception(f"Download finished, but post-processing to MP3 failed. Original file was at {potential_original_path}")
-         else:
-            raise Exception(f"Download finished, but expected output file {final_file_path} is missing.")
-
-    logger.info(f"Successfully downloaded and processed to: {final_file_path}")
-    
-    return {
-        'id': info['id'],
-        'title': info['title'],
-        'thumbnail': info.get('thumbnail', ''),
-        'duration': info.get('duration', 0),
-        'url': video_url, 
-        'file_path': final_file_path 
-    }
-
-def search_youtube(query, limit=10):
-    """Search for videos on YouTube"""
-    ydl_opts = {
-        'format': 'bestaudio/best',
+        'format': 'bestaudio/best', # Select best audio-only, fallback to best overall
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
-        'extract_flat': True,
+        'skip_download': True, # Crucial: Only get info/URL
     }
     
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        # Search using the ytsearch prefix
-        result = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-        videos = []
+    logger.info(f"Fetching stream info for {video_url}")
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            
+            stream_url = info.get('url') # URL selected by yt-dlp based on format
+            
+            # Fallback logic (less likely needed with bestaudio/best but safe)
+            if not stream_url:
+                logger.warning(f"No direct stream URL found in info dict for {video_url}. Checking formats...")
+                formats = info.get('formats', [])
+                for f in formats:
+                    # Prioritize audio-only formats with http protocol
+                    if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and f.get('protocol') in ('http', 'https'):
+                        stream_url = f.get('url')
+                        logger.info(f"Found suitable audio format URL: {f.get('format_id')}")
+                        break
+                if not stream_url:
+                     # Last resort: find any http format URL
+                     for f in formats:
+                         if f.get('protocol') in ('http', 'https'):
+                            stream_url = f.get('url')
+                            logger.warning(f"Falling back to non-audio-only format URL: {f.get('format_id')}")
+                            break
+            
+            if not stream_url:
+                raise Exception("Could not find any suitable stream URL.")
+                
+            logger.info(f"Successfully fetched stream info for {info.get('title')}")
+            
+            return {
+                'id': info['id'],
+                'title': info['title'],
+                'thumbnail': info.get('thumbnail', ''), # Keep thumbnail URL for frontend queue display
+                'duration': info.get('duration', 0),
+                'url': video_url, # Original YT URL
+                'stream_url': stream_url # The actual stream URL for the proxy
+            }
+
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"yt-dlp error fetching stream info for {video_url}: {e}")
+        raise Exception(f"Failed to get stream info: {e}") from e
+    except Exception as e:
+        logger.error(f"Unexpected error fetching stream info for {video_url}: {e}")
+        raise
+
+# Removed background_download_worker and download_queue
+# Removed background_cleanup_worker and cleanup_queue
+
+def search_youtube(query, limit=10):
+    """Search for videos on YouTube (without thumbnails)"""
+    ydl_opts = {
+        'format': 'bestaudio/best', # Format selection doesn't impact search listing speed
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': True, # Essential for fast search listing
+    }
+    
+    logger.info(f"Searching YouTube for: {query}")
+    videos = []
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            result = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+            
+            if 'entries' in result:
+                for entry in result['entries']:
+                    # Only include ID, Title, and URL (matching previous state)
+                    videos.append({
+                        'id': entry['id'],
+                        'title': entry['title'],
+                        'url': f"https://www.youtube.com/watch?v={entry['id']}",
+                    })
+            logger.info(f"Found {len(videos)} results for query: {query}")
+    except Exception as e:
+        logger.error(f"Error during yt-dlp search for '{query}': {e}")
+        # Re-raise or handle as appropriate for the calling route
+        raise 
         
-        if 'entries' in result:
-            for entry in result['entries']:
-                videos.append({
-                    'id': entry['id'],
-                    'title': entry['title'],
-                    'thumbnail': entry.get('thumbnail', ''),
-                    'url': f"https://www.youtube.com/watch?v={entry['id']}",
-                })
-        
-        return videos
+    return videos
 
 # Routes
 @app.route('/')
@@ -455,7 +508,7 @@ def get_queue():
 @app.route('/api/queue', methods=['POST'])
 @auth.login_required
 def add_to_queue():
-    """Add a song to the queue immediately and start download in background."""
+    """Add a song to the queue by fetching its stream info."""
     data = request.json
     video_url = data.get('url')
     
@@ -464,45 +517,15 @@ def add_to_queue():
     
     try:
         logger.info(f"Add to Queue request for URL: {video_url}")
+        # Fetch stream info synchronously (should be faster than download)
+        track_info = get_audio_stream_info(video_url)
         
-        # 1. Extract basic info quickly (no download yet)
-        logger.info(f"Extracting initial info for {video_url}...")
-        ydl_opts_info = {
-            'format': 'bestaudio/best',
-            'noplaylist': True,
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': True, # Don't download here
-        }
-        with yt_dlp.YoutubeDL(ydl_opts_info) as ydl_info:
-            info = ydl_info.extract_info(video_url, download=False)
-            if not info:
-                 raise Exception("Could not extract video info.")
-
-        track_id = info['id']
-        # Create initial track data (no file_path yet)
-        initial_track_info = {
-            'id': track_id,
-            'title': info['title'],
-            'thumbnail': info.get('thumbnail', ''),
-            'duration': info.get('duration', 0),
-            'url': video_url, 
-            'file_path': None # Mark as pending download
-        }
+        # Add full info (including stream_url) to player queue
+        position = player.add_to_queue(track_info)
         
-        # 2. Add to player queue immediately
-        position = player.add_to_queue(initial_track_info)
-        
-        # 3. Queue background download task
-        logger.info(f"Queueing background download for {track_id} ({info['title']})")
-        download_queue.put((video_url, track_id, initial_track_info))
-        
-        # 4. Return immediate success to frontend
-        return jsonify({
-            'message': 'Added to queue (downloading in background)',
-            'position': position,
-            'track': initial_track_info # Send back info without file_path
-        })
+        # Return info *without* stream_url to frontend
+        track_for_frontend = {k: v for k, v in track_info.items() if k != 'stream_url'}
+        return jsonify({'message': 'Added to queue', 'position': position, 'track': track_for_frontend})
         
     except Exception as e:
         logger.error(f"Error processing add to queue for {video_url}: {e}")
@@ -516,7 +539,7 @@ def remove_from_queue(index):
     track = player.remove_from_queue(index)
     if track:
         # Return filtered track info
-        track_for_frontend = {k: v for k, v in track.items() if k != 'file_path'}
+        track_for_frontend = {k: v for k, v in track.items() if k != 'stream_url'}
         return jsonify({'message': 'Removed from queue', 'track': track_for_frontend})
     return jsonify({'error': 'Invalid queue index'}), 400
 
@@ -561,6 +584,77 @@ def stop_player():
         return jsonify({'message': 'Playback stopped'})
     return jsonify({'error': 'Failed to stop playback'}), 400
 
+@app.route('/api/player/volume', methods=['POST'])
+@auth.login_required
+def set_player_volume():
+    """Set the player volume."""
+    data = request.json
+    volume = data.get('volume')
+    
+    if volume is None:
+        return jsonify({'error': 'Volume parameter is required'}), 400
+        
+    try:
+        volume_level = int(volume)
+        if player.set_volume(volume_level) != -1:
+             logger.info(f"Volume set to {volume_level} via API")
+             return jsonify({'message': 'Volume set', 'volume': volume_level})
+        else:
+             logger.error("Failed to set volume via player method")
+             return jsonify({'error': 'Failed to set volume'}), 500
+    except ValueError:
+        logger.warning(f"Invalid volume value received: {volume}")
+        return jsonify({'error': 'Invalid volume value'}), 400
+    except Exception as e:
+        logger.error(f"Error setting volume: {e}")
+        return jsonify({'error': 'Internal server error setting volume'}), 500
+
+@app.route('/stream/<track_id>')
+# @auth.login_required # REMOVED: VLC cannot authenticate this internal request
+def stream_proxy(track_id):
+    """Proxy the audio stream from YouTube to VLC."""
+    actual_stream_url = None
+    track_title = "N/A"
+    
+    # Safely get the stream URL for the currently playing track
+    with player.lock:
+        if player.current_track and player.current_track.get('id') == track_id:
+            actual_stream_url = player.current_track.get('stream_url')
+            track_title = player.current_track.get('title', 'N/A')
+        else:
+            # This might happen if the track just changed or was stopped
+            logger.warning(f"Stream request for {track_id}, but it's not the current track.")
+            # Return a 404 or an empty response
+            return Response(status=404)
+
+    if not actual_stream_url:
+        logger.error(f"Stream requested for {track_id} ({track_title}), but stream URL is missing!")
+        return Response(status=500)
+
+    logger.info(f"Proxying stream for {track_id} ({track_title}) from {actual_stream_url[:80]}...")
+    
+    try:
+        # Use requests to get the stream from YouTube
+        # Important: stream=True to avoid loading entire content into memory
+        # Add a basic User-Agent header, sometimes helps
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        req = requests.get(actual_stream_url, stream=True, headers=headers, timeout=10) # Add timeout
+        req.raise_for_status() # Raise exception for bad status codes (4xx or 5xx)
+
+        # Stream the content back to VLC chunk by chunk
+        # stream_with_context ensures the request context isn't lost if the generator pauses
+        return Response(stream_with_context(req.iter_content(chunk_size=8192)), 
+                        content_type=req.headers['content-type'])
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch stream from YouTube URL for {track_id} ({track_title}): {e}")
+        return Response(f"Error fetching stream: {e}", status=502) # Bad Gateway
+    except Exception as e:
+         logger.error(f"Unexpected error in stream proxy for {track_id} ({track_title}): {e}")
+         return Response(f"Unexpected proxy error: {e}", status=500)
+
 # Handle static files (JavaScript, CSS)
 @app.route('/static/<path:path>')
 def send_static(path):
@@ -575,30 +669,8 @@ def not_found(error):
     # Or render a specific 404 template if you have one.
     return render_template('index.html')
 
-def background_download_worker():
-    """Worker thread to process download tasks from the queue."""
-    while True:
-        video_url, track_id, initial_info = download_queue.get() # Blocks until item available
-        logger.info(f"Background worker picked up download task for {track_id} ({initial_info.get('title')})")
-        try:
-            # Perform the full download
-            downloaded_track_info = download_audio_to_temp(video_url)
-            # Update the player's queue with the file path
-            player.update_track_filepath(track_id, downloaded_track_info['file_path'])
-        except Exception as e:
-            logger.error(f"Background download failed for {track_id} ({initial_info.get('title')}): {e}")
-            # Optionally notify the player or frontend that download failed
-            # For now, just remove from pending so worker doesn't get stuck
-            with player.lock:
-                player.pending_downloads.discard(track_id)
-                # Maybe remove from queue too if download fails?
-                # Depends on desired behavior
-        finally:
-            download_queue.task_done() # Notify queue the task is complete
-
-# Start the background download worker thread
-download_thread = threading.Thread(target=background_download_worker, daemon=True)
-download_thread.start()
-
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True) 
+    # Store port for the stream URL construction
+    server_port = 5000 
+    app.config['SERVER_PORT'] = server_port
+    app.run(host='0.0.0.0', port=server_port, debug=True, threaded=True) # Ensure threaded=True for handling stream + UI requests 

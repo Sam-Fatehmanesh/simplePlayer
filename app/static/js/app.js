@@ -8,9 +8,11 @@ new Vue({
         queue: [],
         currentTrack: null,
         isPlaying: false,
+        currentVolume: 80, // Initialize with a default value
         isLoading: false,
         statusInterval: null,
-        notifications: []
+        notifications: [],
+        isDraggingVolume: false
     },
     created() {
         // Initialize the player
@@ -111,9 +113,36 @@ new Vue({
                 .then(response => {
                     this.isPlaying = response.data.is_playing;
                     this.currentTrack = response.data.current_track;
+                    // Update volume from status, only if not currently dragging slider
+                    // (Prevents visual jump during drag)
+                    if (!this.isDraggingVolume) { 
+                        this.currentVolume = response.data.volume;
+                    }
                 })
                 .catch(error => {
-                    console.error('Error fetching player status:', error);
+                    // Avoid logging error if it's just a network blip during status poll
+                    // console.error('Error fetching player status:', error);
+                });
+        },
+        
+        // Set volume via API
+        setVolume() {
+            // Indicate dragging to prevent fetchPlayerStatus overwriting the slider visually
+            this.isDraggingVolume = true; 
+            // Debounce or throttle this if needed, but @input is usually fine
+            axios.post('/api/player/volume', { volume: this.currentVolume })
+                .then(response => {
+                    // Volume set successfully
+                })
+                .catch(error => {
+                    console.error('Error setting volume:', error);
+                    this.showNotification('Error setting volume', 'error');
+                    // Fetch status again to revert slider if API call failed
+                    this.fetchPlayerStatus(); 
+                })
+                .finally(() => {
+                     // Allow status updates to control slider again after a short delay
+                     setTimeout(() => { this.isDraggingVolume = false; }, 250); 
                 });
         },
         
