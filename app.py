@@ -24,7 +24,7 @@ app.jinja_env.variable_end_string = ']}'
 
 # Configuration
 app.config['SECRET_KEY'] = 'your-secret-key-here'
-app.config['PASSWORD'] = 'musicfun'  # Password for users to access the app
+app.config['PASSWORD'] = 'fuckyourmother'  # Password for users to access the app
 # No longer need TEMP_DIR
 
 # Authentication
@@ -72,25 +72,41 @@ class MusicPlayer:
 
             # --- State Check and Action Decision (within Lock) ---
             with self.lock:
-                # A. Check for Error/Stopped state requiring potential restart
+                natural_end_detected = False # Flag for normal track completion
+                
+                # A. Check player state if playing
                 if self.is_playing and self.player and self.current_track:
                     state = self.player.get_state()
-                    if state == vlc.State.Error or \
-                       (state == vlc.State.Stopped and not hasattr(self.player, '_manually_stopped')):
-                        
-                        logger.warning(f"Worker: Detected unexpected stop/error (State: {state}) for {self.current_track['title']}")
+                    current_time_ms = self.player.get_time()
+                    total_duration_ms = self.get_duration() # Use the method that has fallback
+                    
+                    is_error_or_unexpected_stop = (
+                        state == vlc.State.Error or
+                        (state == vlc.State.Stopped and not hasattr(self.player, '_manually_stopped'))
+                    )
+                    
+                    # Check for premature end (ended significantly before duration)
+                    is_premature_end = (
+                        state == vlc.State.Ended and 
+                        total_duration_ms > 0 and 
+                        current_time_ms < total_duration_ms - 2000 # Threshold: 2 seconds
+                    )
+                    
+                    # B. Trigger Restart if needed
+                    if is_error_or_unexpected_stop or is_premature_end:
+                        log_reason = "error/unexpected stop" if is_error_or_unexpected_stop else "premature end"
+                        logger.warning(f"Worker: Detected {log_reason} (State: {state}, Time: {current_time_ms}/{total_duration_ms}) for {self.current_track['title']}")
                         if self.current_track_retry_count < self.max_retries:
                             # Prepare for restart
                             attempt_restart = True
                             track_info_for_restart = self.current_track.copy()
-                            restart_seek_time = self.player.get_time()
+                            restart_seek_time = current_time_ms # Use the time just before error/end
                             self.current_track_retry_count += 1
                             logger.info(f"Preparing restart #{self.current_track_retry_count} for {track_info_for_restart['id']} from {restart_seek_time}ms")
                             self.player.stop() # Stop player cleanly
                             self.is_playing = False
-                            # Keep self.current_track set for restart attempt
                         else:
-                            # Max retries reached - Give up
+                            # Max retries reached
                             logger.error(f"Worker: Max retries ({self.max_retries}) reached for {self.current_track['title']}. Giving up.")
                             if self.queue and self.queue[0]['id'] == self.current_track['id']:
                                 self.queue.pop(0)
@@ -98,14 +114,26 @@ class MusicPlayer:
                             self.current_track = None
                             self.current_track_retry_count = 0
                             self.last_playback_time = 0
-                            
-                    # Clear manual stop flag if detected
+                    
+                    # C. Handle Natural End
+                    elif state == vlc.State.Ended:
+                         # If it ended and wasn't premature, it's a natural end
+                         logger.info(f"Worker: Detected normal playback end for {self.current_track['title']}. Advancing queue.")
+                         if self.queue and self.queue[0]['id'] == self.current_track['id']:
+                             self.queue.pop(0) 
+                         self.is_playing = False
+                         self.current_track = None
+                         self.current_track_retry_count = 0 
+                         self.last_playback_time = 0
+                         natural_end_detected = True # Set flag
+                         
+                    # D. Clear manual stop flag if detected
                     elif state == vlc.State.Stopped and hasattr(self.player, '_manually_stopped'):
                         logger.info("Worker: Clearing manual stop flag.")
                         del self.player._manually_stopped
-                        # State (is_playing=False, current_track=None) should already be correct from stop()
+                        # State is already handled by stop() method
                 
-                # B. Check if we should play the next track (only if idle and not restarting)
+                # E. Check if we should play the next track (idle, not restarting, queue not empty)
                 if not self.is_playing and not attempt_restart and self.queue:
                     track_to_play_next = self.queue[0]
                     track_id_to_play_next = track_to_play_next.get('id')
@@ -165,27 +193,15 @@ class MusicPlayer:
                 logger.info(f"Worker: Starting normal playback for {track_to_play_next['title']}")
                 local_stream_proxy_url = f"http://127.0.0.1:{app.config.get('SERVER_PORT', 5000)}/stream/{track_id_to_play_next}"
                 with self.lock: 
-                    # Check if track is still first
+                    # Check if track is still first before starting
                     if self.queue and self.queue[0]['id'] == track_id_to_play_next:
                         self.current_track = track_to_play_next 
+                        # Log the assigned track info, especially duration
+                        logger.info(f"Worker: Set current_track. Duration from metadata: {self.current_track.get('duration')}")
                         self.play(local_stream_proxy_url) # Play normally (no seek)
                     else:
                         logger.info(f"Worker: Track {track_id_to_play_next} was no longer first when trying normal play.")
             
-            # 3. Check for Natural Track End (only if not restarting/starting)
-            elif self.is_playing and self.player: # Use elif to avoid check immediately after starting
-                state = self.player.get_state()
-                if state == vlc.State.Ended:
-                     with self.lock:
-                         if self.is_playing and self.current_track: # Still playing this track?
-                             logger.info(f"Worker: Detected normal playback end for {self.current_track['title']}. Advancing queue.")
-                             if self.queue and self.queue[0]['id'] == self.current_track['id']:
-                                 self.queue.pop(0) 
-                             self.is_playing = False
-                             self.current_track = None
-                             self.current_track_retry_count = 0 
-                             self.last_playback_time = 0
-                         
             # --- Delay before next cycle ---
             time.sleep(0.25)
 
@@ -297,31 +313,24 @@ class MusicPlayer:
         else:
              self.is_playing = True
              logger.info(f"VLC initiated playback for {stream_proxy_url}")
-             if seek_time > 1000: # Only seek if time is significant (e.g., > 1 second)
-                 # Attempt to seek *after* playback starts
-                 # There might be a slight delay needed for the player to be ready
-                 # Using a small delay here. A more robust way involves VLC events, but is complex.
-                 def _delayed_seek(time_ms):
-                      try:
-                           # Wait briefly for player state to hopefully become Playing
-                           time.sleep(0.5) 
-                           logger.info(f"Attempting to seek to {time_ms}ms")
-                           # set_time returns 0 on success, -1 on error.
-                           seek_success = self.player.set_time(time_ms)
-                           if seek_success == 0:
-                                logger.info(f"Successfully seeked to {time_ms}ms")
-                           else:
-                                logger.warning(f"Failed to seek to {time_ms}ms (return code: {seek_success}). Player state: {self.player.get_state()}")
-                                # Try set_position as a fallback?
-                                # pos = time_ms / (self.player.get_length() or 1) 
-                                # self.player.set_position(pos)
-                      except Exception as e:
-                           logger.error(f"Error during delayed seek: {e}")
-
-                 # Run the seek in a separate thread to avoid blocking the play call
-                 seek_thread = threading.Thread(target=_delayed_seek, args=(seek_time,), daemon=True)
-                 seek_thread.start()
-                 
+             if seek_time > 500: # Only seek if time is > 0.5 seconds
+                 logger.info(f"Initial seek requested to {seek_time}ms")
+                 # Attempt initial seek immediately after play starts
+                 # Schedule a slightly delayed re-attempt as fallback
+                 self.player.set_time(seek_time)
+                 def _delayed_seek_attempt(time_ms):
+                     time.sleep(0.6) # Slightly longer delay
+                     try:
+                         current_time = self.player.get_time()
+                         # Only re-seek if the initial one likely failed (time is still near 0)
+                         if self.is_playing and current_time < time_ms - 500: 
+                             logger.warning(f"Initial seek might have failed (current: {current_time}ms). Re-attempting seek to {time_ms}ms")
+                             seek_success = self.player.set_time(time_ms)
+                             if seek_success != 0:
+                                 logger.error(f"Delayed seek failed (return code: {seek_success})")
+                     except Exception as e:
+                         logger.error(f"Error during delayed seek attempt: {e}")
+                 threading.Thread(target=_delayed_seek_attempt, args=(seek_time,), daemon=True).start()
              return True
 
     # ... (Keep pause, resume)
@@ -351,19 +360,26 @@ class MusicPlayer:
             return [{k: v for k, v in track.items() if k != 'stream_url'} for track in self.queue]
 
     def get_status(self):
-        """Get the current player status (excluding stream URLs)."""
+        """Get the current player status including time/duration."""
         with self.lock:
             current_track_info = None
             if self.current_track:
                  current_track_info = {k: v for k, v in self.current_track.items() if k != 'stream_url'}
             
-            current_volume = self.get_volume() # Get current volume
+            current_volume = self.get_volume()
+            current_time = self.get_current_time()
+            duration = self.get_duration()
+            
+            # Log the values being fetched
+            logger.debug(f"Status Update - Time: {current_time}, Duration: {duration}, IsPlaying: {self.is_playing}")
             
             return {
                 'is_playing': self.is_playing,
                 'current_track': current_track_info,
                 'queue_length': len(self.queue),
-                'volume': current_volume, # Add volume to status
+                'volume': current_volume,
+                'current_time_ms': current_time,
+                'duration_ms': duration,
             }
 
     def get_volume(self):
@@ -380,6 +396,61 @@ class MusicPlayer:
             logger.info(f"Setting volume to: {clamped_volume}")
             return self.player.audio_set_volume(clamped_volume)
         return -1 # Indicate error
+
+    def get_current_time(self):
+        """Get current playback time in milliseconds."""
+        if self.player and self.is_playing:
+            return self.player.get_time()
+        return 0
+
+    def get_duration(self):
+        """Get total track duration in milliseconds."""
+        # Prioritize duration from metadata if available and valid
+        if self.current_track and self.current_track.get('duration') and self.current_track['duration'] > 0:
+             duration_ms = int(self.current_track['duration'] * 1000)
+             logger.debug(f"get_duration: Using metadata duration: {duration_ms}ms")
+             return duration_ms
+        
+        # Fallback to player.get_length() if metadata is missing/invalid
+        if self.player:
+            duration = self.player.get_length()
+            if duration > 0:
+                logger.debug(f"get_duration: Using player.get_length(): {duration}ms")
+                return duration
+            else:
+                 logger.debug(f"get_duration: player.get_length() returned {duration}, falling back.")
+        else:
+             logger.debug("get_duration: Player not available for get_length(), falling back.")
+                
+        logger.debug("get_duration: Returning 0 (no valid source found)")
+        return 0 # Return 0 if neither source provides a valid duration
+
+    def seek(self, time_ms):
+        """Seek playback to a specific time in milliseconds."""
+        if self.player and self.is_playing and self.player.is_seekable(): # Add is_seekable check
+            try:
+                seek_target_ms = int(time_ms)
+                logger.info(f"Attempting seek to {seek_target_ms}ms")
+                result = self.player.set_time(seek_target_ms)
+                
+                # Check result explicitly: 0 is success, -1 is error
+                if result == 0:
+                    logger.info(f"Seek to {seek_target_ms}ms successful (returned 0)")
+                    self.last_playback_time = seek_target_ms 
+                    return True
+                else:
+                    # Includes case where result might be -1 or unexpectedly None
+                    logger.error(f"Seek failed (return code: {result})")
+                    return False
+            except Exception as e:
+                 logger.error(f"Exception during seek: {e}", exc_info=True)
+                 return False
+        elif not self.player or not self.is_playing:
+             logger.warning("Seek ignored: Player not active or playing.")
+        elif not self.player.is_seekable():
+             logger.warning("Seek ignored: Stream reported as not seekable by VLC.")
+             
+        return False
 
 # Initialize player
 player = MusicPlayer()
@@ -426,11 +497,14 @@ def get_audio_stream_info(video_url):
                 
             logger.info(f"Successfully fetched stream info for {info.get('title')}")
             
+            duration_seconds = info.get('duration', 0)
+            logger.info(f"Extracted duration from yt-dlp: {duration_seconds} seconds")
+            
             return {
                 'id': info['id'],
                 'title': info['title'],
                 'thumbnail': info.get('thumbnail', ''), # Keep thumbnail URL for frontend queue display
-                'duration': info.get('duration', 0),
+                'duration': duration_seconds, # Store duration in seconds
                 'url': video_url, # Original YT URL
                 'stream_url': stream_url # The actual stream URL for the proxy
             }
@@ -608,6 +682,31 @@ def set_player_volume():
     except Exception as e:
         logger.error(f"Error setting volume: {e}")
         return jsonify({'error': 'Internal server error setting volume'}), 500
+
+@app.route('/api/player/seek', methods=['POST'])
+@auth.login_required
+def seek_player():
+    """Seek the player to a specific time."""
+    data = request.json
+    time_ms = data.get('time_ms')
+    
+    if time_ms is None:
+        return jsonify({'error': 'time_ms parameter is required'}), 400
+        
+    try:
+        seek_target_ms = int(time_ms)
+        if player.seek(seek_target_ms):
+             # Optional: Return current status after seek? 
+             # For now, just confirm success.
+             return jsonify({'message': 'Seek successful'})
+        else:
+             return jsonify({'error': 'Seek failed'}), 500
+    except ValueError:
+        return jsonify({'error': 'Invalid time_ms value'}), 400
+    except Exception as e:
+        # Any other exception during the process
+        logger.error(f"Error during seek route: {e}", exc_info=True) # Add exc_info=True
+        return jsonify({'error': 'Internal server error during seek'}), 500
 
 @app.route('/stream/<track_id>')
 # @auth.login_required # REMOVED: VLC cannot authenticate this internal request

@@ -375,10 +375,127 @@ body {
 
 .player-center-controls {
     display: flex;
+    /* Arrange progress bar above buttons */
+    flex-direction: column; 
+    align-items: center;
+    gap: 8px; /* Reduced gap */
+    flex: 1.5; /* Allow center to take a bit more space */
+    justify-content: center; 
+    max-width: 600px; /* Limit width */
+    margin: 0 auto; /* Center if space available */
+}
+
+.progress-container {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.current-time,
+.total-duration {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    min-width: 35px; /* Prevent layout shifts */
+    text-align: center;
+}
+
+input[type="range"].progress-bar {
+    flex-grow: 1;
+    height: 4px;
+    border-radius: 2px;
+    /* Default track background (remaining time) */
+    background-color: #535353; 
+    cursor: pointer;
+    -webkit-appearance: none;
+    appearance: none;
+    /* accent-color: var(--primary-light); REMOVE this - we use pseudo-elements now */
+    outline: none;
+    transition: height 0.1s ease-in-out;
+    /* Add overflow hidden for webkit gradient trick */
+    overflow: hidden;
+}
+
+input[type="range"].progress-bar:hover {
+    height: 6px; /* Slightly thicker on hover */
+}
+
+/* --- WebKit (Chrome, Safari, Edge) Track & Fill --- */
+input[type="range"].progress-bar::-webkit-slider-runnable-track {
+    height: 100%;
+    background: linear-gradient(to right, 
+        var(--primary-dark) var(--progress-percent, 0%), 
+        #535353 var(--progress-percent, 0%)
+    );
+    border-radius: 2px;
+}
+
+/* --- Firefox Track & Fill --- */
+input[type="range"].progress-bar::-moz-range-track {
+    height: 100%;
+    background: #535353;
+    border-radius: 2px;
+}
+input[type="range"].progress-bar::-moz-range-progress {
+    background-color: var(--primary-dark);
+    height: 100%;
+    border-radius: 2px;
+}
+
+/* --- Thumb Styles (Keep mostly as is) --- */
+input[type="range"].progress-bar::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    background: var(--text-primary);
+    border-radius: 50%;
+    cursor: pointer;
+    opacity: 0; /* Hidden by default */
+    transition: opacity 0.2s ease-in-out;
+    /* Add margin-top to center thumb vertically (WebKit needs this) */
+    margin-top: -5px; /* Adjust as needed: (track_height - thumb_height) / 2 */
+    /* Add box-shadow to simulate border for gradient trick */
+    box-shadow: -400px 0 0 400px var(--primary-dark); /* Fill color */
+}
+
+input[type="range"].progress-bar::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    background: var(--text-primary);
+    border-radius: 50%;
+    cursor: pointer;
+    border: none;
+    opacity: 0;
+    transition: opacity 0.2s ease-in-out;
+}
+
+/* Show thumb when progress bar is hovered or focused */
+.progress-container:hover input[type="range"].progress-bar::-webkit-slider-thumb,
+input[type="range"].progress-bar:focus::-webkit-slider-thumb {
+    opacity: 1;
+}
+.progress-container:hover input[type="range"].progress-bar::-moz-range-thumb,
+input[type="range"].progress-bar:focus::-moz-range-thumb {
+    opacity: 1;
+}
+
+/* Disabled state */
+input[type="range"].progress-bar:disabled {
+    cursor: not-allowed;
+    accent-color: var(--border-color);
+}
+input[type="range"].progress-bar:disabled::-webkit-slider-thumb {
+    opacity: 0;
+}
+input[type="range"].progress-bar:disabled::-moz-range-thumb {
+    opacity: 0;
+}
+
+.playback-buttons {
+    display: flex;
     align-items: center;
     gap: 16px;
-    flex: 1; /* Take up center space */
-    justify-content: center; /* Center the controls */
 }
 
 .player-center-controls .play-pause {

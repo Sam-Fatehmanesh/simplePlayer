@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ricketts Hovse</title>
+
+<link rel="stylesheet" type="text/css" href="/static/ricketts/style.css" />
+<link rel="stylesheet" type="text/css" href="/static/ricketts/normalize.css" />
+<link href="//fonts.googleapis.com/css?family=Raleway:400,300,600" rel="stylesheet" type="text/css">
+<link rel="stylesheet" type="text/css" href="//cdn.jsdelivr.net/npm/slick-carousel@1.8.1/slick/slick.css"/>
+<link rel="stylesheet" type="text/css" href="//cdn.jsdelivr.net/npm/slick-carousel@1.8.1/slick/slick-theme.css"/>
+<style>
+.slick-slide {
+       height:300px;
+}
+
+.slick-slide img {
+       height:300px;
+}
+</style>
+<!-- TODO update the rotating images -->
+<meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+
+<div class="container">
+    <div class="row" style="margin-top: 20%">
+        <h2>Ricketts Hovse</h2>
+            <div class="slider">
+                <div><img src="/static/ricketts/slider/slider_0.JPG"></div>
+                <div><img src="/static/ricketts/slider/slider_2.JPG"></div>
+                <div><img src="/static/ricketts/slider/slider_3.JPG"></div>
+                <div><img src="/static/ricketts/slider/slider_4.JPG"></div>
+                <div><img src="/static/ricketts/slider/slider_5.JPG"></div>
+            </div>
+    </div>
+    <div class="row" style="margin-bottom: 10%">
+        <div class="two-thirds column">
+            <p> In 2005, the Caltech administration pressured Ricketts to make our website private because many of the pictures and quotes on the website were potentially offensive. This is that website.</p>
+            <p>If you would like to see the rest of the site, we invite you to join Ricketts Hovse.</p>
+            <p>To find contacts for Hovse Officers/Representatives go to ASCIT’s <a href="https://donut.caltech.edu/campus_positions">website</a> and select Ricketts Hovse.</p>  
+	    <p> When you walk alone, you're never lost. At least, that's the operating principle behind Napalm, the website project of Ricketts Hovse. Over its first three itterations, Ricketts followed its own idiosyncratic vision, a journey that's taken it from sturdy flash-based indie animation to, on 2017's "Napalm 2.0," a bleary-eyed take on barebones WebDev. Now, with "Napalm 3.0," Ricketts is putting down roots in aesthetic territory all its own. -- Adapted from HOMESHAKE </p>
+            <form method="post" action="/login/">
+                <input type="hidden" name="csrfmiddlewaretoken" value="ZzdyX60xLMnXevLO3v1a8ttsbYbNNBoudbxE9ME2RdSw67JgI30tJTf4K9zfQX2j">
+                <label for="id_username">Username:</label> 
+                <input type="text" name="username" autofocus autocapitalize="none" autocomplete="username" maxlength="150" required id="id_username">
+                <label for="id_password">Password:</label> 
+                <input type="password" name="password" autocomplete="current-password" required id="id_password"><br><br>
+                <input type="submit" name="login" value="Login">
+                <input type="hidden" name="next" value="/"/>
+            </form>
+            
+        </div>
+    </div>
+</div>
+
+<script type="text/javascript" src="//code.jquery.com/jquery-1.11.0.min.js"></script>
+<script type="text/javascript" src="//code.jquery.com/jquery-migrate-1.2.1.min.js"></script>
+<script type="text/javascript" src="//cdn.jsdelivr.net/npm/slick-carousel@1.8.1/slick/slick.min.js"></script>
+<script type="text/javascript">
+$(document).ready(function(){
+        $('.slider').slick({
+            dots: true,
+            variableWidth: true,
+            adaptiveHeight: true
+            });
+        });
+</script>
+</body>
+</html>
